@@ -1,0 +1,6 @@
+.pio/
+.vscode/
+include/*.pio.h
+.DS_Store
+*.ii
+*.s

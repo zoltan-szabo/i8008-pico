@@ -1,0 +1,126 @@
+; Intel 8008 support rig: all PIO programs plus the pin map.
+; Assembled to include/i8008.pio.h by pre_build.py (pioasm).
+
+; ---------------------------------------------------------------------------
+; Pin map (matches the breadboard wiring of the older hardware/rp2040/8008 rig)
+; ---------------------------------------------------------------------------
+.define public PIN_STATE_2 2    ; 8008 S2 -- S2 on the LOWEST gpio, so the raw
+.define public PIN_STATE_1 3    ; 8008 S1    3-bit state code is bit-reversed
+.define public PIN_STATE_0 4    ; 8008 S0    relative to the datasheet S2S1S0
+.define public PIN_DATA_0 5     ; 8008 D0
+.define public PIN_DATA_1 6
+.define public PIN_DATA_2 7
+.define public PIN_DATA_3 8
+.define public PIN_DATA_4 9
+.define public PIN_DATA_5 10
+.define public PIN_DATA_6 11
+.define public PIN_DATA_7 12    ; 8008 D7
+.define public PIN_BUS_WRITE 13 ; debug output: high while the Pico drives D0-D7
+.define public PIN_READY 14     ; 8008 READY input
+.define public PIN_INT 15       ; 8008 INT input
+.define public PIN_CLK1 26      ; 8008 phase 1 clock
+.define public PIN_CLK2 27      ; 8008 phase 2 clock
+.define public PIN_SYNC 28      ; 8008 SYNC output
+
+.define public CAPTURE_BITS 14  ; gpio 2..15: S2 S1 S0, D0..D7, BUS_WRITE, READY, INT
+.define public BUS_DRIVE_IRQ 4  ; PIO1 irq flag, core1 -> bus_write: "T3 captured, release after this state"
+
+; ---------------------------------------------------------------------------
+; clk: non-overlapping two-phase clock on PIN_CLK1/PIN_CLK2.
+; 4 instructions per period; with clkdiv 66 at 125 MHz this is 473 kHz.
+; ---------------------------------------------------------------------------
+.program clk
+.wrap_target
+    set pins, 0b00
+    set pins, 0b01      ; phase 1 high
+    set pins, 0b00
+    set pins, 0b10      ; phase 2 high
+.wrap
+
+; ---------------------------------------------------------------------------
+; capture: one 14-bit snapshot per T-state, taken at CLK2 high inside the
+; SYNC-high half. Only pushes when the sample differs from the previous one,
+; so the RX FIFO (drained by DMA into a ring buffer) carries every state
+; transition and nothing else.
+; ---------------------------------------------------------------------------
+.program capture
+    set x, 0
+.wrap_target
+sample:
+    in null, 32                      ; clear ISR
+    wait 1 gpio PIN_SYNC
+    wait 1 gpio PIN_CLK2
+    in pins, CAPTURE_BITS
+    in null, (32 - CAPTURE_BITS)     ; right-justify: sample ends up in bits 13..0
+    mov y, isr
+    jmp x!=y changed
+    wait 0 gpio PIN_SYNC             ; one sample per SYNC cycle
+    jmp sample
+changed:
+    push block
+    mov x, y
+    wait 0 gpio PIN_SYNC
+.wrap
+
+; ---------------------------------------------------------------------------
+; single_step: pulse READY for one machine cycle, synchronized to SYNC/CLK.
+; Any nonzero word in the TX FIFO fires one step.
+; ---------------------------------------------------------------------------
+.program single_step
+    set pins, 0b0        ; power-on: not READY, CPU freezes in WAIT
+.wrap_target
+main:
+    pull block
+    mov y, osr
+    jmp !y main
+    wait 1 gpio PIN_SYNC
+    wait 0 gpio PIN_SYNC
+    wait 1 gpio PIN_CLK2
+    set pins, 0b1        ; READY
+    wait 1 gpio PIN_CLK1
+    set pins, 0b0        ; not READY
+.wrap
+
+; ---------------------------------------------------------------------------
+; int_request: pulse INT, raised at CLK1 high, held for N sysclk cycles
+; (N = the word pushed into the TX FIFO).
+; ---------------------------------------------------------------------------
+.program int_request
+    set pins, 0b0        ; no INT
+.wrap_target
+main:
+    pull block
+    mov y, osr
+    jmp !y main
+    wait 1 gpio PIN_CLK1
+    set pins, 0b1        ; INT
+    wait 0 gpio PIN_CLK1
+iloop:
+    jmp y-- iloop
+    set pins, 0b0        ; no INT
+.wrap
+
+; ---------------------------------------------------------------------------
+; bus_write: serve one byte to the CPU during T3 of a read cycle.
+; core1 pushes the byte right after the T2 capture. The SM preloads the
+; output latches, waits for the next T-state boundary (SYNC edge) before
+; taking the bus, then holds it -- through any WAIT states while single
+; stepping -- until core1 confirms the T3 sample via BUS_DRIVE_IRQ, and
+; releases at the following state boundary. PIN_BUS_WRITE mirrors the
+; output-enable for scope/trace visibility.
+; ---------------------------------------------------------------------------
+.program bus_write
+.side_set 1 opt
+.wrap_target
+    pull block side 0
+    out pins, 8              ; preload data while pins are still inputs
+    wait 0 gpio PIN_SYNC
+    wait 1 gpio PIN_SYNC     ; boundary of the next T-state (T3, or WAIT if stepping)
+    mov osr, ~null
+    out pindirs, 8 side 1    ; drive the bus
+    wait 1 irq BUS_DRIVE_IRQ ; core1 saw the T3 sample
+    wait 0 gpio PIN_SYNC
+    wait 1 gpio PIN_SYNC     ; end of T3
+    mov osr, null
+    out pindirs, 8 side 0    ; release the bus
+.wrap
