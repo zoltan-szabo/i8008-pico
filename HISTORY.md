@@ -1,0 +1,26 @@
+# History
+
+Release notes. Commit messages stay short; the detail lives here.
+
+## 2026-08-02 -- Working rig
+
+First working state, verified on real silicon:
+
+- Boot via INT plus a jammed RST 0 (the 8008 has no reset pin); the PC
+  lands at 0x0000 reliably even when the marginal S2 line hides the
+  interrupt-acknowledge state.
+- Program execution from the Pico's emulated 16 KB RAM at 473 kHz,
+  including PCW memory writes back into the array. The built-in test
+  program counts into 0x0040, observable with the `x` dump.
+- Single-stepping one machine cycle per keypress with a gap-free trace.
+- `j` command: jam a three-byte JMP to force the PC anywhere without a
+  stack push.
+- Capture pipeline: debounced 14-bit PIO snapshot every clock period (two
+  per T-state), DMA ring buffer, RAM-resident core-1 bus engine, lock-free
+  event ring to the core-0 trace printer.
+- The `monitor` wrapper script finds the rig's serial port by USB identity,
+  so replugging the board never breaks the workflow.
+
+The README tells the full bring-up story: the half-T-state output lag, the
+read latch that closes before T3 is visible, the flash/XIP real-time trap,
+and the rest of what the chip taught me on the way here.

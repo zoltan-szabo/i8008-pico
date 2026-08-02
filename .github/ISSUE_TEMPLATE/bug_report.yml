@@ -1,0 +1,49 @@
+name: i8008-pico bug report
+description: Wrong trace, failed serve, boot problem, or crash
+labels: [bug]
+body:
+  - type: input
+    id: version
+    attributes:
+      label: Firmware version
+      description: Commit hash the firmware was built from.
+      placeholder: e.g. 31b07b1
+    validations:
+      required: true
+  - type: input
+    id: chip
+    attributes:
+      label: CPU and rig
+      description: 8008 variant and date code if readable, plus anything unusual about the level shifting or wiring.
+      placeholder: e.g. Intel C8008-1, '75 date code, transistor level shifters
+    validations:
+      required: true
+  - type: input
+    id: commands
+    attributes:
+      label: Monitor commands used
+      placeholder: e.g. b, then w, then s repeatedly
+    validations:
+      required: true
+  - type: textarea
+    id: trace
+    attributes:
+      label: Trace excerpt
+      description: The numbered monitor lines around the problem. A dozen lines is usually enough; single-step traces are the most useful.
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behaviour
+      description: What the CPU should have done (cite the 8008 datasheet or MCS-8 manual if relevant).
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behaviour
+      description: What happened instead -- wrong fetch, halt, garbage state, no wake, etc.
+    validations:
+      required: true
