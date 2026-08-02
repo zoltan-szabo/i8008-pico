@@ -4,7 +4,7 @@
 #include <string.h>
 
 const char *const STATE_NAME[8] = {"WAIT", "T2", "T1", "T1I", "T3", "T5", "STOP", "T4"};
-const char *const CYCLE_NAME[4] = {"PCI", "PCR", "PCC", "PCW"};
+const char *const CYCLE_NAME[4] = {"PCI", "PCC", "PCR", "PCW"};
 
 static const char REG[9] = "ABCDEHLM";
 static const char COND[5] = "CZSP";

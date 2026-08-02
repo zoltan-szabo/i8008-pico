@@ -1,123 +1,256 @@
 # i8008-pico
 
 A Raspberry Pi Pico (RP2040) acting as the complete support system for a real
-Intel 8008 CPU (1972): clock generator, single-stepper, interrupt source,
-bus/state analyzer and emulated memory. The goal is to run programs on the
-real chip while seeing every T-state of every machine cycle, as detailed as
-possible, on a serial console.
+Intel 8008 CPU from 1972: clock generator, single-stepper, interrupt source,
+bus analyzer and emulated memory. I want to see this chip think -- every
+T-state of every machine cycle, decoded and printed on a serial console --
+and ultimately to put it through a thorough test.
 
-Successor to the earlier `hardware/rp2040/i8008a` (clock/step/state bring-up
-rig, proven on hardware) and `hardware/rp2040/8008` (first data bus + memory
-attempt) experiments, with their known bugs fixed.
+This is the third incarnation of the idea. The first rig
+(`hardware/rp2040/i8008a`) proved I could clock the chip, single-step it via
+READY and read its state lines. The second (`hardware/rp2040/8008`) attempted
+the data bus and memory emulation but never quite worked. This project
+started as a cleaned-up merge of the two, and then the chip itself took over
+the curriculum: almost everything I believed about its bus timing turned out
+to be wrong, and the story of finding that out is documented below, because
+the findings are the real value of this repository.
 
-## Architecture
+## What works today
 
-Five PIO state machines do all the hard real-time work; the two CPU cores
-split the rest:
+Verified on the real chip (August 2026):
 
-- `clk` (PIO0): non-overlapping two-phase clock, 473 kHz (125 MHz / 66 / 4).
-- `single_step` (PIO0): pulses READY for one machine cycle, synchronized to
-  SYNC and the clock phases.
-- `int_request` (PIO0): pulses INT, raised on a CLK1 edge.
-- `capture` (PIO1): samples S2..S0, D0..D7, BUS_WRITE, READY and INT (14 bits)
-  once per T-state at CLK2-high inside SYNC-high, and pushes only changes.
-  A free-running DMA channel drains it into a 1024-word ring buffer, so no
-  transition is ever lost, even in free-run.
-- `bus_write` (PIO1): drives a served byte onto D0..D7 for exactly the T3
-  window: takes the bus at a T-state boundary, holds it through WAIT states
-  while single stepping, releases at the boundary after core 1 confirms the
-  T3 sample (PIO IRQ flag 4). PIN_BUS_WRITE mirrors the output enable for a
-  scope.
+- Boot: the 8008 has no reset pin, so I interrupt it and jam a RST 0
+  instruction onto the bus; the PC lands at 0x0000 and my program runs.
+- Program execution from emulated memory: the CPU fetches every byte from a
+  16 KB array in the Pico's RAM at 473 kHz, full speed, and the test
+  program's counter is observable in a RAM dump while it runs.
+- Memory writes: PCW cycles are decoded and committed back into the array.
+- Single-stepping: one machine cycle per keypress, with a gap-free trace.
+- Forced jumps: a JMP to any address can be jammed into the instruction
+  stream, which is the only way to set this CPU's program counter from
+  outside.
 
-Core 1 (`bus_engine.cpp`) consumes the ring buffer: latches the address at
-T1/T1I, reads the cycle type at T2 (PCI/PCR/PCC/PCW), serves bytes from the
-16 KB `i8008_ram[]` for read cycles, jams RST 0 on interrupt acknowledge,
-commits PCW writes back to RAM, and forwards every transition to core 0
-through a multicore-safe queue.
+## The 8008's states, as I met them
 
-Core 0 (`main.cpp`) runs the serial CLI and prints the decoded trace,
-including 8008 mnemonics (`i8008_decode.cpp` covers the full instruction set).
+The 8008 multiplexes everything over 8 data pins and announces what it is
+doing on three state outputs S2 S1 S0. One machine cycle is a sequence of
+T-states:
 
-## Pin map
+| State | S2 S1 S0 | Meaning |
+|-------|----------|---------|
+| T1    | 0 1 0    | low address byte on the bus |
+| T1I   | 1 1 0    | same, but this cycle is an interrupt acknowledge |
+| T2    | 1 0 0    | high 6 address bits plus the 2-bit cycle code |
+| WAIT  | 0 0 0    | READY was low, CPU is paused between T2 and T3 |
+| T3    | 0 0 1    | the data transfer: instruction in, data in, or data out |
+| T4,T5 | 1 1 1 / 1 0 1 | internal execution states (register transfers visible on the bus) |
+| STOPPED | 0 1 1  | HLT was executed; only an interrupt revives it |
 
-| GPIO  | Signal    | Direction (Pico view) |
-|-------|-----------|-----------------------|
-| 2     | S2        | in                    |
-| 3     | S1        | in                    |
-| 4     | S0        | in                    |
-| 5-12  | D0-D7     | in, out during T3     |
-| 13    | BUS_WRITE | out (debug: bus driven)|
-| 14    | READY     | out                   |
-| 15    | INT       | out                   |
-| 26    | CLK1      | out                   |
-| 27    | CLK2      | out                   |
-| 28    | SYNC      | in                    |
+The cycle code on D7:D6 during T2 tells what kind of transfer T3 will be:
+00 PCI instruction fetch, 01 PCC I/O command, 10 PCR data read (including
+the extra bytes of multi-byte instructions), 11 PCW memory write. Getting
+PCC and PCR the right way around cost me an afternoon; my old project's
+table had it right and I "corrected" it into being wrong.
 
-Note: S2 is wired to the lowest GPIO, so the raw captured 3-bit state code is
-bit-reversed relative to the datasheet's S2 S1 S0 ordering. The decode table
-in `main.h` (`ST_*`) is the single source of truth for this.
+Because a boot ROM is just whatever answers the fetches, memory emulation
+means: latch the address from T1 and T2, and during T3 either drive a byte
+from the RAM array onto the bus (reads) or sample the bus into the array
+(writes). Simple in principle. The rest of this document is about why it
+was not simple in practice.
 
-The pin map lives in `include/i8008.pio` as public defines and is shared by
-the PIO programs and the C++ code.
+## What the chip taught me
 
-## Serial commands (115200 baud)
+I had a logic-analyzer-grade capture running before the memory serving
+worked, and that turned out to be the only reason this project succeeded:
+every wrong theory died by trace evidence. These are the facts this
+particular chip (and rig) established, in the order they were discovered:
+
+**A floating bus is an instruction stream.** Before serving worked, the CPU
+happily executed whatever the floating bus decayed to: 0x3F is RET, so it
+ran in circles at the top of memory; 0x00 is HLT, so it "mysteriously"
+stopped. Watching garbage execute is a surprisingly good way to learn the
+instruction encoding.
+
+**The outputs lag half a T-state.** When I finally sampled the bus twice per
+T-state, the trace showed that during the first clock period of every state
+the bus and even the S0-S2 lines still carry the previous state's values;
+they settle in the second period. Every decode (address latch, cycle code,
+write data) must use the settled second sample. My first engine decoded the
+early sample and cheerfully wrote garbage into RAM from misread "PCW"
+cycles.
+
+**The read latch closes before T3 is even visible.** The CPU latches
+incoming data early in the real T3 -- before the state lines (which lag,
+see above) ever show the T3 code. Serving data when I saw T3 was therefore
+always too late, and the byte had to be on the bus before the end of T2.
+The freakiest symptom along the way: the CPU executed RST 1 when I jammed
+RST 0 (0x05), because it latched the bus mid-transition (0x3F decaying to
+0x05 passes through 0x0D). An instruction latched from the falling edges of
+other instructions.
+
+**The serve path is hard real time.** Between capturing the settled T2
+sample and the byte being driven there is a budget of a couple of
+microseconds. Two things silently blew it: the core-1 code executing from
+flash (a single XIP cache miss while core 0 hammers USB is enough), and the
+pico-sdk's queue functions, also in flash. The fix was pinning the entire
+core-1 hot path into RAM with `__not_in_flash_func` and replacing the SDK
+queue with a hand-rolled lock-free single-producer ring. Symptom before the
+fix: serves worked "about one time in three", which felt like electronics
+but was software.
+
+**S2 is marginal on my rig.** T1I reads as T1 and T4 as STOP now and then --
+all pairs that differ only in S2. Consequence: I cannot rely on detecting
+the interrupt-acknowledge cycle, so the boot jam is armed as "force RST 0
+on the next instruction fetch, whatever the state lines claim". This line
+needs a scope session; until then the workaround is solid.
+
+**The chip is dynamic and it dies cold.** PMOS dynamic logic loses its mind
+when the clock stops, which happens for two seconds at every firmware
+reflash. The first boot afterwards fetches nonsense and usually halts;
+the second or third `b` finds a warmed-up, sane CPU. Also, INT pulses
+shorter than about 4 microseconds are simply not recognized.
+
+**There is no reset.** The only way to control the PC from outside is
+through the instruction stream itself. `b` jams RST 0 (a one-byte call to
+0x0000, which costs a push onto the internal stack), and `j` jams a full
+three-byte JMP -- opcode on the next fetch, the two address bytes on the
+following PCR cycles -- which moves the PC anywhere without touching the
+stack.
+
+## The monitor
+
+The monitor is deliberately primitive: single-character commands over USB
+serial at 115200 baud, no line editor, no protocol -- just me, the chip,
+and a trace. Start it with:
+
+    ./monitor
+
+(the script finds the rig's port by USB identity, VID:PID 2E8A:000A, so it
+does not matter which socket or name the board gets; `pio device monitor -p
+<port>` works too if you prefer doing it by hand).
+
+### Commands
 
 | Key | Action |
 |-----|--------|
-| b   | boot: READY high + INT pulse (RST 0 jammed on the ack cycle) |
-| s   | single step, one machine cycle |
-| g   | go / free run (READY held high) |
-| w   | wait / halt (READY low) |
-| i   | INT pulse |
-| x   | dump RAM 0x0000-0x007F |
-| z   | reset the bus_write SM, release the bus |
+| b   | boot: READY high, INT pulse, RST 0 jammed on the next fetch; PC ends at 0x0000 |
+| j   | jam JMP: prompts for a hex address (1-4 digits, Enter; Esc cancels), forces the PC there without a stack push |
+| s   | single step: one machine cycle |
+| g   | go: free run (READY held high) |
+| w   | wait: halt (READY low; the CPU parks in WAIT mid-cycle) |
+| i   | bare INT pulse |
+| x   | dump emulated RAM 0x0000-0x00FF |
+| z   | force-release the data bus and reset the bus-drive state machine |
 | d   | toggle raw 14-bit sample dump |
-| h   | help |
+| h   | this list |
 
-Trace line format:
+### Reading the trace
 
-    seq    state  D7......D0 hex   flags  annotation
-       42  T2     00000000 0x00    R..    PCI 0x0006
-       43  T3     00000100 0x04    R.D    fetch ADI
+Every captured sample prints as one line:
 
-Flags: R = READY, I = INT, D = Pico driving the bus.
+    26829  T2    00000000 0x00  ...  PCI 0x000C  serve 0x44 (jam)
+    26831  T3    01000100 0x44  ..D  fetch JMP
 
-## Default test program
+The columns: sequence number, T-state, the data bus in binary and hex,
+three flags (R = READY high, I = INT high, D = the Pico is driving the
+bus), and an annotation: address latching at T1/T1I, cycle type and full
+address at T2 plus the byte being served, and at T3 the decoded mnemonic
+of a fetched instruction, the data byte of a read, or the committed
+memory write.
 
-Loaded into emulated RAM at boot (rest of memory filled with 0xC0 = LAA, the
-canonical 8008 NOP):
+Each T-state appears twice, once per clock period. This is intentional --
+it is how the half-state output lag stays visible, and during T4/T5 the
+second sample often shows internal register values passing over the bus
+(the accumulator, for instance, is readable in the counter program's T4
+states).
 
-    0x0000  2E 00     LHI 0x00
-    0x0002  36 40     LLI 0x40
-    0x0004  06 00     LAI 0x00
-    0x0006  04 01     ADI 0x01     <- loop
-    0x0008  F8        LMA          ; ram[HL] = A, exercises a PCW write cycle
-    0x0009  44 06 00  JMP 0x0006
+In free run the CPU produces around 470k samples per second and USB serial
+prints a small fraction of them; the monitor reports how many trace lines
+were dropped. Nothing is lost inside: the engine sees every sample and the
+memory emulation never misses a cycle. For gap-free reading, halt with `w`
+and step with `s`.
 
-Watch it run with `b` then `g` (or step with `s`), and verify the write with
-`x`: address 0x0040 should count up.
+### A session, start to finish
 
-## Build
+    ./monitor
+    b            (cold chip: repeat until the trace starts flowing)
+    w            halt
+    x            dump RAM: 0x0040 holds the counter
+    g            run a moment
+    w            halt again
+    x            0x0040 has advanced
+    s s s ...    watch LMA write the counter, JMP loop back, ADI increment
+    j 0007       jump to the LAI, resetting the counter, without a reset pin
 
-PlatformIO with the Arduino-Pico (earlephilhower) core:
+## The test program
 
-    pio run              # build
-    pio run -t upload    # flash
-    pio device monitor   # trace console
+`src/memory.cpp` preloads the 16 KB emulated RAM. Everything outside the
+program is filled with 0xC0 (LAA, the canonical 8008 NOP), which makes the
+whole address space a safe landing pad:
 
-`pre_build.py` assembles `include/*.pio` with pioasm (from PATH or
-/usr/local/bin) into the generated `include/*.pio.h` headers, which are not
-committed.
+    0x0000  C0 C0 C0  LAA x3       landing pad after RST 0
+    0x0003  2E 00     LHI 0x00
+    0x0005  36 40     LLI 0x40     HL = 0x0040
+    0x0007  06 00     LAI 0x00
+    0x0009  04 01     ADI 0x01     <- loop
+    0x000B  F8        LMA          ram[HL] = A
+    0x000C  44 09 00  JMP 0x0009
 
-## Status and open points
+It exercises instruction fetch (PCI), immediate reads (PCR) and memory
+writes (PCW). To run something else, edit `boot_program[]` and reflash.
 
-- The whole bus-serving path (capture ring, T3-window bus drive, PCW writes,
-  RST 0 jam) is new and needs verification on the real chip; the earlier rigs
-  only proved clock/step/state capture.
-- The exact SYNC phase relative to T-state boundaries should be confirmed on
-  a scope; the bus_write timing assumes SYNC rises once per T-state.
-  PIN_BUS_WRITE exists precisely to make this visible.
+## Building and flashing
+
+PlatformIO with the Arduino-Pico (earlephilhower) core. No external
+libraries; everything beyond the core is pico-sdk, and the PIO programs are
+assembled by `pre_build.py` with pioasm.
+
+    pio run              build
+    pio run -t upload    flash; the rig is auto-detected by USB identity
+    ./monitor            console
+
+## Firmware architecture
+
+Five PIO state machines do the hard real-time work:
+
+- `clk` (PIO0): non-overlapping two-phase clock, 473 kHz (125 MHz / 66 / 4).
+- `single_step` (PIO0): a READY pulse synchronized to SYNC and the clock,
+  advancing exactly one machine cycle.
+- `int_request` (PIO0): the INT pulse, raised on a CLK1 edge.
+- `capture` (PIO1): a debounced 14-bit snapshot (S2 S1 S0, D0-D7,
+  BUS_WRITE, READY, INT) at every phi1 rising edge -- two per T-state. A
+  free-running DMA channel drains it into a 1024-word ring buffer.
+- `bus_write` (PIO1): drives a served byte onto D0-D7 the moment core 1
+  pushes it (mid-T2, per the latch timing above), holds through WAIT states
+  until T3 becomes visible plus a microsecond, then releases. GPIO13
+  mirrors the output enable for a scope.
+
+Core 1 is the bus engine (`bus_engine.cpp`): it consumes the DMA ring,
+tracks machine cycles from the settled samples, serves RAM on PCI/PCR,
+handles the jam sequence, commits PCW writes, and hands events to core 0
+through the RAM-resident SPSC ring. The whole path is pinned out of flash.
+Core 0 (`main.cpp`) owns the CLI and the trace printer, draining events in
+bounded bursts so commands stay responsive under full trace load.
+
+## Pico to 8008 connections
+
+To be documented properly once the KiCad schematic of the rig exists. Until
+then the pin map lives at the top of `include/i8008.pio` (state lines on
+GPIO 2-4 with S2 lowest, data bus on GPIO 5-12, BUS_WRITE debug on 13,
+READY 14, INT 15, clocks on 26/27, SYNC on 28). Level shifting between the
+Pico's 3.3 V and the PMOS 8008 (+5 V / -9 V) is on the hardware side and
+predates this repository.
+
+## The thorough test
+
+The actual goal of all this: a systematic exercise of the real silicon --
+instruction set coverage, interrupt behavior, timing envelopes, the odd
+corners (the circular stack, HLT/interrupt interactions, INP/OUT). Not
+written yet; the plan and results will be added here.
+
+## Open points
+
+- Scope the S2 level shifter; T1I/T1 and T4/STOP confusions trace back to it.
 - I/O cycles (PCC, INP/OUT) are decoded and traced but not implemented.
-- Interfacing levels: the 8008 is PMOS (+5 V / -9 V); the RP2040 is a 3.3 V
-  device and not 5 V tolerant. Level shifting is the hardware side's problem,
-  same as with the previous rigs.
+- A way to load programs over serial instead of reflashing.
+- The KiCad schematic, then the connections chapter above.

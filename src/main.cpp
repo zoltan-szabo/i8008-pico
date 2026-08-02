@@ -2,14 +2,12 @@
 
 #include "main.h"
 
-queue_t event_queue;
 volatile uint32_t evq_dropped = 0;
 volatile bool hw_ready = false;
 uint32_t capture_ring[RING_WORDS] __attribute__((aligned(RING_WORDS * sizeof(uint32_t))));
 int dma_ch = -1;
 uint sm_clk, sm_step, sm_int, sm_capture, sm_bus_write;
-
-static uint bus_write_offset;
+uint bus_write_offset;
 static uint32_t seq = 0;
 static bool raw_debug = false;
 
@@ -58,6 +56,8 @@ static void setup_bus_write() {
 	pio_sm_config c = bus_write_program_get_default_config(bus_write_offset);
 	sm_config_set_out_pins(&c, PIN_DATA_0, 8);
 	sm_config_set_out_shift(&c, true, false, 32);
+	sm_config_set_in_pins(&c, PIN_STATE_2);      // state-line polling for the T3 window
+	sm_config_set_in_shift(&c, false, false, 32); // shift left: S2 lands on bit 0, matches T3_RAW
 	sm_config_set_sideset_pins(&c, PIN_BUS_WRITE);
 	for (uint pin = PIN_DATA_0; pin <= PIN_DATA_7; pin++)
 		pio_gpio_init(pio1, pin);
@@ -119,14 +119,81 @@ static void cmd_int() {
 	Serial.println("INT pulse");
 }
 
+static void arm_jam(const uint8_t *seq, uint8_t len) {
+	jam_len = 0; // disarm while updating
+	jam_pos = 0;
+	for (uint8_t i = 0; i < len; i++)
+		jam_seq[i] = seq[i];
+	jam_len = len; // publish last
+}
+
 static void cmd_boot() {
-	Serial.println("boot: READY high + INT pulse (RST 0 will be jammed)");
+	Serial.println("boot: READY high + INT pulse, RST 0 jammed on the next fetch");
+	static const uint8_t rst0[] = {0x05};
+	arm_jam(rst0, 1);
 	pio_sm_set_pins_with_mask(pio0, sm_step, 1u << PIN_READY, 1u << PIN_READY);
 	pio_sm_put_blocking(pio0, sm_int, INT_PULSE_CYCLES);
 }
 
+// Read up to 4 hex digits terminated by Enter. Echoes input; returns false
+// on empty input, a non-hex character, or Esc.
+static bool read_hex_addr(uint16_t *out) {
+	uint16_t val = 0;
+	uint8_t ndigits = 0;
+
+	Serial.print("addr (hex): ");
+	while (true) {
+		while (!Serial.available())
+			;
+		char ch = Serial.read();
+		if (ch == '\r' || ch == '\n') {
+			Serial.println();
+			if (ndigits == 0)
+				return false;
+			*out = val;
+			return true;
+		}
+		if (ch == 0x1B) { // Esc
+			Serial.println(" cancelled");
+			return false;
+		}
+		int digit;
+		if (ch >= '0' && ch <= '9')
+			digit = ch - '0';
+		else if (ch >= 'a' && ch <= 'f')
+			digit = ch - 'a' + 10;
+		else if (ch >= 'A' && ch <= 'F')
+			digit = ch - 'A' + 10;
+		else {
+			Serial.println(" not hex, cancelled");
+			return false;
+		}
+		if (ndigits == 4) {
+			Serial.println(" too long, cancelled");
+			return false;
+		}
+		Serial.print(ch);
+		val = (val << 4) | digit;
+		ndigits++;
+	}
+}
+
+// Jam a JMP <addr>: flow change without touching the 8008's call stack
+// (unlike the RST 0 boot). Pulses INT so it also works from STOPPED; in
+// single-step mode, keep pressing 's' to watch the jam go in.
+static void cmd_jump() {
+	uint16_t target;
+	if (!read_hex_addr(&target))
+		return;
+	target &= RAM_MASK;
+	uint8_t jmp[3] = {0x44, (uint8_t)(target & 0xFF), (uint8_t)(target >> 8)};
+	arm_jam(jmp, 3);
+	pio_sm_put_blocking(pio0, sm_int, INT_PULSE_CYCLES);
+	Serial.printf("jam JMP 0x%04X armed, INT pulsed\n", target);
+}
+
 static void cmd_dump() {
-	for (uint16_t a = 0; a < 0x80; a += 16) {
+	for (uint16_t a = 0; a < 0x100; a += 16) {
 		Serial.printf("%04X:", a);
 		for (uint16_t i = 0; i < 16; i++)
 			Serial.printf(" %02X", i8008_ram[a + i]);
@@ -134,22 +201,27 @@ static void cmd_dump() {
 	}
 }
 
-// Force bus_write back to a released, idle state (recovery after a desync,
-// e.g. a serve that never met its T3).
-static void cmd_bus_reset() {
+// Force bus_write back to a released, idle state. Used by the 'z' command and
+// by core 1 on every T1I, so a byte stranded by a HLT can never be delivered
+// in place of the RST 0 jam after the next interrupt.
+void bus_write_reset() {
 	pio_sm_set_enabled(pio1, sm_bus_write, false);
 	pio_sm_clear_fifos(pio1, sm_bus_write);
-	pio_interrupt_clear(pio1, BUS_DRIVE_IRQ);
 	pio_sm_set_consecutive_pindirs(pio1, sm_bus_write, PIN_DATA_0, 8, false);
 	pio_sm_restart(pio1, sm_bus_write);
 	pio_sm_exec(pio1, sm_bus_write, pio_encode_jmp(bus_write_offset));
 	pio_sm_set_enabled(pio1, sm_bus_write, true);
+}
+
+static void cmd_bus_reset() {
+	bus_write_reset();
 	Serial.println("bus_write reset, bus released");
 }
 
 static void cmd_help() {
 	Serial.println("i8008-pico commands:");
-	Serial.println("  b  boot: READY high + INT pulse");
+	Serial.println("  b  boot: READY high + INT pulse, RST 0 jam -> PC 0x0000");
+	Serial.println("  j  jam JMP <addr> (hex entry, no stack push)");
 	Serial.println("  s  single step (one machine cycle)");
 	Serial.println("  g  go / free run (READY high)");
 	Serial.println("  w  wait / halt (READY low)");
@@ -184,7 +256,7 @@ static void print_event(const event_t &e) {
 	case ST_T2:
 		if (e.flags & EV_SERVED)
 			snprintf(note, sizeof note, "%s 0x%04X  serve 0x%02X%s", CYCLE_NAME[e.cycle], e.addr,
-			         e.served, (e.flags & EV_INTACK) ? " (RST 0 jam)" : "");
+			         e.served, (e.flags & EV_JAM) ? " (jam)" : "");
 		else
 			snprintf(note, sizeof note, "%s 0x%04X", CYCLE_NAME[e.cycle], e.addr);
 		break;
@@ -224,7 +296,6 @@ void setup() {
 	Serial.begin(115200);
 
 	i8008_ram_load();
-	queue_init(&event_queue, sizeof(event_t), 512);
 
 	setup_clock();
 	setup_single_step();
@@ -238,11 +309,15 @@ void setup() {
 }
 
 void loop() {
-	event_t ev;
 	static uint32_t dropped_seen = 0;
 
-	while (queue_try_remove(&event_queue, &ev))
+	// Bounded drain: in free run the queue refills faster than USB prints,
+	// so an unbounded loop here would starve command processing forever.
+	for (int burst = 0; burst < 32 && evq_tail != evq_head; burst++) {
+		event_t ev = evq_buf[evq_tail];
+		evq_tail = (evq_tail + 1) & (EVQ_SIZE - 1);
 		print_event(ev);
+	}
 
 	if (evq_dropped != dropped_seen) {
 		dropped_seen = evq_dropped;
@@ -253,6 +328,7 @@ void loop() {
 		char command = Serial.read();
 		switch (command) {
 		case 'b': cmd_boot(); break;
+		case 'j': cmd_jump(); break;
 		case 's': cmd_step(); break;
 		case 'g': cmd_run(); break;
 		case 'w': cmd_halt(); break;

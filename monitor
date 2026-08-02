@@ -1,0 +1,24 @@
+#!/bin/bash
+# Open the trace console on the rig Pico, wherever it is plugged in.
+# Resolves the serial port by USB identity (plain Pico, VID:PID 2E8A:000A)
+# instead of the /dev/cu.usbmodemXXXX name, which changes with the socket.
+
+PIO="$HOME/.platformio/penv/bin/pio"
+PY="$HOME/.platformio/penv/bin/python3"
+
+PORT=$("$PY" - <<'EOF'
+from serial.tools import list_ports
+for p in list_ports.comports():
+    if p.vid == 0x2E8A and p.pid == 0x000A:
+        print(p.device)
+        break
+EOF
+)
+
+if [ -z "$PORT" ]; then
+    echo "rig Pico (VID:PID 2E8A:000A) not found -- is it plugged in?" >&2
+    exit 1
+fi
+
+echo "rig found on $PORT"
+exec "$PIO" device monitor -p "$PORT" "$@"

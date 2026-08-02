@@ -23,7 +23,7 @@
 .define public PIN_SYNC 28      ; 8008 SYNC output
 
 .define public CAPTURE_BITS 14  ; gpio 2..15: S2 S1 S0, D0..D7, BUS_WRITE, READY, INT
-.define public BUS_DRIVE_IRQ 4  ; PIO1 irq flag, core1 -> bus_write: "T3 captured, release after this state"
+.define public T3_RAW 4         ; T3 state code as read from the pins (S2 on the lowest gpio)
 
 ; ---------------------------------------------------------------------------
 ; clk: non-overlapping two-phase clock on PIN_CLK1/PIN_CLK2.
@@ -38,28 +38,32 @@
 .wrap
 
 ; ---------------------------------------------------------------------------
-; capture: one 14-bit snapshot per T-state, taken at CLK2 high inside the
-; SYNC-high half. Only pushes when the sample differs from the previous one,
-; so the RX FIFO (drained by DMA into a ring buffer) carries every state
-; transition and nothing else.
+; capture: one debounced 14-bit snapshot per CLOCK PERIOD (two per T-state),
+; taken right after the phi1 rising edge -- T-states begin at phi1 rising,
+; so the first snapshot of a state lands within ~200 ns of its onset. That
+; early T2 snapshot is what lets the serve reach the bus before T3 begins
+; (this 8008 latches read data essentially at T3 onset). The sample is read
+; twice, 32 ns apart, until two consecutive reads agree (state lines settle
+; slowly through the level shifters). Only changes are pushed; DMA drains
+; the RX FIFO into a ring buffer, so no transition is ever lost. The second
+; snapshot per state also records mid-state bus changes for the trace.
+; x = last pushed sample, stashed in OSR while y/x hold the double-read.
 ; ---------------------------------------------------------------------------
 .program capture
-    set x, 0
 .wrap_target
-sample:
-    in null, 32                      ; clear ISR
-    wait 1 gpio PIN_SYNC
-    wait 1 gpio PIN_CLK2
+    wait 1 gpio PIN_CLK1
+resample:
+    in null, 32
     in pins, CAPTURE_BITS
-    in null, (32 - CAPTURE_BITS)     ; right-justify: sample ends up in bits 13..0
-    mov y, isr
-    jmp x!=y changed
-    wait 0 gpio PIN_SYNC             ; one sample per SYNC cycle
-    jmp sample
-changed:
-    push block
-    mov x, y
-    wait 0 gpio PIN_SYNC
+    in null, (32 - CAPTURE_BITS)     ; right-justify: bits 13..0
+    mov y, isr                       ; first read
+    in null, 32
+    in pins, CAPTURE_BITS
+    in null, (32 - CAPTURE_BITS)
+    mov x, isr                       ; second read
+    jmp x!=y resample                ; not stable yet
+    push block                       ; every period is pushed; core1 dedupes
+    wait 0 gpio PIN_CLK1
 .wrap
 
 ; ---------------------------------------------------------------------------
@@ -101,26 +105,37 @@ iloop:
 .wrap
 
 ; ---------------------------------------------------------------------------
-; bus_write: serve one byte to the CPU during T3 of a read cycle.
-; core1 pushes the byte right after the T2 capture. The SM preloads the
-; output latches, waits for the next T-state boundary (SYNC edge) before
-; taking the bus, then holds it -- through any WAIT states while single
-; stepping -- until core1 confirms the T3 sample via BUS_DRIVE_IRQ, and
-; releases at the following state boundary. PIN_BUS_WRITE mirrors the
-; output-enable for scope/trace visibility.
+; bus_write: serve one byte to the CPU for T3 of a read cycle.
+; The 8008 latches read data at the START of T3, so the byte must already be
+; stable on the bus when T3 begins. core1 pushes the byte during T2; the SM
+; preloads the output latches and takes the bus at the next phi2 FALLING
+; edge -- the point where the CPU stops driving its T2 address, 528 ns
+; before the phi1 rising edge that starts T3 (our own clock's dead band, so
+; no contention). It then holds the bus through any WAIT states (bus floats
+; there; single stepping parks between T2 and T3) until the state lines
+; show T3, plus 2 us to cover the latch, then releases.
+; PIN_BUS_WRITE mirrors the output-enable for scope/trace visibility.
 ; ---------------------------------------------------------------------------
 .program bus_write
 .side_set 1 opt
 .wrap_target
     pull block side 0
     out pins, 8              ; preload data while pins are still inputs
-    wait 0 gpio PIN_SYNC
-    wait 1 gpio PIN_SYNC     ; boundary of the next T-state (T3, or WAIT if stepping)
     mov osr, ~null
-    out pindirs, 8 side 1    ; drive the bus
-    wait 1 irq BUS_DRIVE_IRQ ; core1 saw the T3 sample
-    wait 0 gpio PIN_SYNC
-    wait 1 gpio PIN_SYNC     ; end of T3
+    out pindirs, 8 side 1    ; drive immediately: the byte arrives mid-T2
+                             ; (settled-sample decode + fast pipeline), the
+                             ; CPU has released the bus by then, and the read
+                             ; latch closes early in real T3 -- well before
+                             ; the VISIBLE state code changes to T3
+    set y, T3_RAW
+wait_t3:
+    mov isr, null
+    in pins, 3               ; sample S2 S1 S0
+    mov x, isr
+    jmp x!=y wait_t3         ; hold through WAIT states until T3 is visible
+    set y, 15
+hold:
+    jmp y-- hold [7]         ; ~1 us past visible T3 onset, then release
     mov osr, null
     out pindirs, 8 side 0    ; release the bus
 .wrap
