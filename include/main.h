@@ -46,6 +46,7 @@ enum {
 #define EV_WRITE 0x02  // memory write committed (set on the T3 event)
 #define EV_INTACK 0x04 // cycle started with T1I (interrupt acknowledge)
 #define EV_JAM 0x08    // served byte came from the jam sequence, not RAM
+#define EV_OUT 0x10    // OUT committed to an output port (set on the T2 event)
 
 typedef struct __attribute__((aligned(4))) {
 	uint16_t raw;   // 14-bit capture: [2:0] S2..S0, [10:3] D0..D7, [11] BUS_WRITE, [12] READY, [13] INT
@@ -64,6 +65,17 @@ extern event_t evq_buf[EVQ_SIZE];
 extern volatile uint32_t evq_head, evq_tail; // head: core1 writes, tail: core0 reads
 
 extern uint8_t i8008_ram[RAM_SIZE];
+
+// I/O ports. INP 0-7 reads io_in[], OUT 8-31 lands in io_out[] (indexed by
+// port number, so io_out[0..7] stay unused). A PCC cycle carries the
+// accumulator at T1 and the instruction byte at T2, whose bits 5..1 are the
+// port: 01 RRM MM1.
+#define IO_IN_PORTS 8
+#define IO_PORTS 32
+#define IO_PORT(t2_byte) (((t2_byte) >> 1) & 0x1F)
+extern volatile uint8_t io_in[IO_IN_PORTS];        // core 0 writes, core 1 serves
+extern volatile uint8_t io_out[IO_PORTS];          // core 1 writes
+extern volatile uint32_t io_out_count[IO_PORTS];   // core 1 writes
 extern volatile uint32_t evq_dropped;
 
 // Jam sequence: instead of RAM, serve these bytes starting at the next

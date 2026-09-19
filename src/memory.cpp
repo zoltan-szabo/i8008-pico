@@ -14,7 +14,17 @@ static const uint8_t boot_program[] = {
 	0x44, 0x09, 0x00, // 0x000C  JMP 0x0009
 };
 
+// I/O test, reached with 'j 0100': echo input port 0 to output port 8.
+// Exercises both PCC flavours; set the input with 'n', watch it with 'p'.
+#define IO_TEST_ADDR 0x0100
+static const uint8_t io_test_program[] = {
+	0x41,             // 0x0100  INP 0        A = port 0
+	0x51,             // 0x0101  OUT 8        port 8 = A
+	0x44, 0x00, 0x01, // 0x0102  JMP 0x0100
+};
+
 void i8008_ram_load() {
 	memset(i8008_ram, 0xC0, RAM_SIZE); // 0xC0 = LAA, the canonical 8008 NOP
 	memcpy(i8008_ram, boot_program, sizeof(boot_program));
+	memcpy(i8008_ram + IO_TEST_ADDR, io_test_program, sizeof(io_test_program));
 }

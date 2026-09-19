@@ -135,13 +135,13 @@ static void cmd_boot() {
 	pio_sm_put_blocking(pio0, sm_int, INT_PULSE_CYCLES);
 }
 
-// Read up to 4 hex digits terminated by Enter. Echoes input; returns false
-// on empty input, a non-hex character, or Esc.
-static bool read_hex_addr(uint16_t *out) {
+// Read up to maxdigits hex digits terminated by Enter. Echoes input; returns
+// false on empty input, a non-hex character, or Esc.
+static bool read_hex(const char *prompt, uint8_t maxdigits, uint16_t *out) {
 	uint16_t val = 0;
 	uint8_t ndigits = 0;
 
-	Serial.print("addr (hex): ");
+	Serial.print(prompt);
 	while (true) {
 		while (!Serial.available())
 			;
@@ -168,7 +168,7 @@ static bool read_hex_addr(uint16_t *out) {
 			Serial.println(" not hex, cancelled");
 			return false;
 		}
-		if (ndigits == 4) {
+		if (ndigits == maxdigits) {
 			Serial.println(" too long, cancelled");
 			return false;
 		}
@@ -183,13 +183,44 @@ static bool read_hex_addr(uint16_t *out) {
 // single-step mode, keep pressing 's' to watch the jam go in.
 static void cmd_jump() {
 	uint16_t target;
-	if (!read_hex_addr(&target))
+	if (!read_hex("addr (hex): ", 4, &target))
 		return;
 	target &= RAM_MASK;
 	uint8_t jmp[3] = {0x44, (uint8_t)(target & 0xFF), (uint8_t)(target >> 8)};
 	arm_jam(jmp, 3);
 	pio_sm_put_blocking(pio0, sm_int, INT_PULSE_CYCLES);
 	Serial.printf("jam JMP 0x%04X armed, INT pulsed\n", target);
+}
+
+// Set the byte an INP from port 0-7 will read.
+static void cmd_set_input() {
+	uint16_t port, value;
+	if (!read_hex("INP port (0-7): ", 1, &port))
+		return;
+	if (port >= IO_IN_PORTS) {
+		Serial.println("no such input port");
+		return;
+	}
+	if (!read_hex("value (hex): ", 2, &value))
+		return;
+	io_in[port] = value;
+	Serial.printf("INP %u will read 0x%02X\n", port, value);
+}
+
+static void cmd_ports() {
+	Serial.print("in: ");
+	for (uint8_t p = 0; p < IO_IN_PORTS; p++)
+		Serial.printf(" %u=%02X", p, io_in[p]);
+	Serial.println();
+	bool any = false;
+	for (uint8_t p = IO_IN_PORTS; p < IO_PORTS; p++) {
+		if (io_out_count[p] == 0)
+			continue;
+		Serial.printf("out %2u = 0x%02X  (%lu writes)\n", p, io_out[p], (unsigned long)io_out_count[p]);
+		any = true;
+	}
+	if (!any)
+		Serial.println("out: no OUT executed yet");
 }
 
 static void cmd_dump() {
@@ -227,6 +258,8 @@ static void cmd_help() {
 	Serial.println("  w  wait / halt (READY low)");
 	Serial.println("  i  INT pulse");
 	Serial.println("  x  dump RAM 0x0000-0x007F");
+	Serial.println("  n  set an input port (INP 0-7) value");
+	Serial.println("  p  show input ports and last OUT per port");
 	Serial.println("  z  reset bus_write SM (release the bus)");
 	Serial.println("  d  toggle raw sample dump");
 	Serial.println("  h  this help");
@@ -254,7 +287,15 @@ static void print_event(const event_t &e) {
 		snprintf(note, sizeof note, "addr.lo <- 0x%02X  INT ACK", bus);
 		break;
 	case ST_T2:
-		if (e.flags & EV_SERVED)
+		if (e.cycle == CYC_PCC) {
+			uint8_t port = IO_PORT(e.addr >> 8);
+			if (e.flags & EV_OUT)
+				snprintf(note, sizeof note, "PCC OUT %u = 0x%02X", port, e.addr & 0xFF);
+			else if (e.flags & EV_SERVED)
+				snprintf(note, sizeof note, "PCC INP %u  serve 0x%02X", port, e.served);
+			else
+				snprintf(note, sizeof note, "PCC port %u", port);
+		} else if (e.flags & EV_SERVED)
 			snprintf(note, sizeof note, "%s 0x%04X  serve 0x%02X%s", CYCLE_NAME[e.cycle], e.addr,
 			         e.served, (e.flags & EV_JAM) ? " (jam)" : "");
 		else
@@ -334,6 +375,8 @@ void loop() {
 		case 'w': cmd_halt(); break;
 		case 'i': cmd_int(); break;
 		case 'x': cmd_dump(); break;
+		case 'n': cmd_set_input(); break;
+		case 'p': cmd_ports(); break;
 		case 'z': cmd_bus_reset(); break;
 		case 'd':
 			raw_debug = !raw_debug;

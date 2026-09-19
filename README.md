@@ -26,6 +26,9 @@ Verified on the real chip (August 2026):
   program's counter is observable in a RAM dump while it runs.
 - Memory writes: PCW cycles are decoded and committed back into the array.
 - Single-stepping: one machine cycle per keypress, with a gap-free trace.
+- I/O: INP from 8 input ports set from the monitor, OUT to 24 output
+  ports recorded for the monitor. On the chip, a PCC cycle shows A at T1
+  and the instruction byte at T2; INP runs T1-T5, OUT stops after T3.
 - Forced jumps: a JMP to any address can be jammed into the instruction
   stream, which is the only way to set this CPU's program counter from
   outside.
@@ -140,6 +143,8 @@ does not matter which socket or name the board gets; `pio device monitor -p
 | w   | wait: halt (READY low; the CPU parks in WAIT mid-cycle) |
 | i   | bare INT pulse |
 | x   | dump emulated RAM 0x0000-0x00FF |
+| n   | set an input port: prompts for the port (0-7) and a hex byte that INP will read |
+| p   | show the input ports and the last value OUT wrote to each output port, with write counts |
 | z   | force-release the data bus and reset the bus-drive state machine |
 | d   | toggle raw 14-bit sample dump |
 | h   | this list |
@@ -156,7 +161,8 @@ three flags (R = READY high, I = INT high, D = the Pico is driving the
 bus), and an annotation: address latching at T1/T1I, cycle type and full
 address at T2 plus the byte being served, and at T3 the decoded mnemonic
 of a fetched instruction, the data byte of a read, or the committed
-memory write.
+memory write. PCC cycles are annotated at T2 with the port and either the
+byte served to INP or the accumulator value OUT sent.
 
 Each T-state appears twice, once per clock period. This is intentional --
 it is how the half-state output lag stays visible, and during T4/T5 the
@@ -197,7 +203,20 @@ whole address space a safe landing pad:
     0x000C  44 09 00  JMP 0x0009
 
 It exercises instruction fetch (PCI), immediate reads (PCR) and memory
-writes (PCW). To run something else, edit `boot_program[]` and reflash.
+writes (PCW). A second program at 0x0100 exercises the I/O cycles (PCC)
+by echoing input port 0 to output port 8:
+
+    0x0100  41        INP 0        A = port 0
+    0x0101  51        OUT 8        port 8 = A
+    0x0102  44 00 01  JMP 0x0100
+
+Reach it with `j 0100`, set the input with `n`, and watch it arrive with
+`p`. To run something else, edit `boot_program[]` and reflash.
+
+A PCC cycle carries the accumulator at T1 and the instruction byte at T2,
+whose bits 5..1 are the port number (`01 RRM MM1`: 0-7 are INP, 8-31
+OUT). INP is served exactly like a memory read, over the same deadline;
+OUT is recorded at T2, since the data has already been on the bus.
 
 ## Building and flashing
 
@@ -227,7 +246,8 @@ Five PIO state machines do the hard real-time work:
 
 Core 1 is the bus engine (`bus_engine.cpp`): it consumes the DMA ring,
 tracks machine cycles from the settled samples, serves RAM on PCI/PCR,
-handles the jam sequence, commits PCW writes, and hands events to core 0
+handles the jam sequence, commits PCW writes, serves INP and records OUT
+on PCC, and hands events to core 0
 through the RAM-resident SPSC ring. The whole path is pinned out of flash.
 Core 0 (`main.cpp`) owns the CLI and the trace printer, draining events in
 bounded bursts so commands stay responsive under full trace load.
@@ -251,6 +271,5 @@ written yet; the plan and results will be added here.
 ## Open points
 
 - Scope the S2 level shifter; T1I/T1 and T4/STOP confusions trace back to it.
-- I/O cycles (PCC, INP/OUT) are decoded and traced but not implemented.
 - A way to load programs over serial instead of reflashing.
 - The KiCad schematic, then the connections chapter above.

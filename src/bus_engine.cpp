@@ -3,7 +3,8 @@
 // Consumes capture samples from the DMA ring buffer, tracks the 8008 machine
 // cycle (address latch at T1/T1I, cycle type at T2), serves instruction and
 // data bytes from i8008_ram through the bus_write state machine, commits PCW
-// writes back to RAM, and forwards every state transition to core 0 as an
+// writes back to RAM, handles PCC cycles (INP served from io_in, OUT
+// recorded in io_out), and forwards every state transition to core 0 as an
 // event for display.
 
 #include "main.h"
@@ -16,6 +17,10 @@ volatile uint32_t evq_head = 0, evq_tail = 0;
 // S2 line, which can make an interrupt acknowledge read as a plain T1.
 volatile uint8_t jam_seq[3];
 volatile uint8_t jam_len = 0, jam_pos = 0;
+
+volatile uint8_t io_in[IO_IN_PORTS];
+volatile uint8_t io_out[IO_PORTS];
+volatile uint32_t io_out_count[IO_PORTS];
 
 static uint32_t rd_idx = 0;
 
@@ -82,7 +87,25 @@ static void __not_in_flash_func(handle_sample)(uint32_t raw) {
 		cycle = bus >> 6;
 		if (int_ack)
 			ev.flags |= EV_INTACK;
-		if (cycle == CYC_PCI || cycle == CYC_PCR) {
+		if (cycle == CYC_PCC) {
+			// addr now holds A (from T1) in the low byte and the
+			// instruction's port bits in the high byte
+			uint8_t port = IO_PORT(bus);
+			if (port < IO_IN_PORTS) {
+				// INP: same serve path and deadline as a PCR read
+				uint8_t data = io_in[port];
+				if (!pio_sm_is_tx_fifo_full(pio1, sm_bus_write)) {
+					pio_sm_put(pio1, sm_bus_write, data);
+					ev.served = data;
+					ev.flags |= EV_SERVED;
+				}
+			} else {
+				// OUT: the accumulator went out at T1, nothing to drive
+				io_out[port] = addr & 0xFF;
+				io_out_count[port]++;
+				ev.flags |= EV_OUT;
+			}
+		} else if (cycle == CYC_PCI || cycle == CYC_PCR) {
 			uint8_t data;
 			if (jam_pos > 0 && jam_pos < jam_len) {
 				// jam in progress: address bytes ride the PCR cycles

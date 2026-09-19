@@ -2,6 +2,16 @@
 
 Release notes. Commit messages stay short; the detail lives here.
 
+## 2026-09-19 -- I/O cycles
+
+PCC cycles are handled: INP 0-7 is served from monitor-set input values
+over the same path and deadline as a memory read, OUT 8-31 is recorded per
+port with a write count. New monitor commands `n` (set an input port) and
+`p` (show ports); the trace annotates PCC cycles with port and data. An
+echo program at 0x0100 (INP 0, OUT 8, JMP) is the test, verified on the
+chip: T1 of a PCC cycle carries the accumulator, T2 the instruction byte
+with the port in bits 5..1; INP runs T1-T5, OUT stops after T3.
+
 ## 2026-08-02 -- Working rig
 
 First working state, verified on real silicon:
