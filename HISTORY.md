@@ -2,6 +2,28 @@
 
 Release notes. Commit messages stay short; the detail lives here.
 
+## 2026-09-19 -- Chip test
+
+`t` and `T` turn the rig into an 8008 tester (docs/chip-testing.md): 19
+functional tests generated as 8008 programs and checked against a
+reference model (every instruction in every form, flags, all ports, the
+14 address lines, the circular stack, HLT and interrupt resume, stray
+writes anywhere in RAM), a T-state length check of every documented
+opcode, a clock sweep, and with `T` every ALU operation over all 65536
+operand pairs. Each run asks for a chip label and ends in a RESULT line
+for logging. The reference chip passes everything at 504 kHz and sweeps
+to 520 kHz.
+
+Rig fixes found on the way:
+
+- The clock is 504 kHz, not 473: the Pico runs at 133 MHz, not the
+  125 MHz the earlier figures assumed.
+- The INT pulse is now 4 clock periods (was 2). A halted chip sometimes
+  woke from the shorter pulse, did a plain fetch and halted again.
+- The bus engine treats T1 and T1I as one state when finding a state's
+  settled sample. A T1 whose first sample read T1I lost its low address
+  byte, so the first fetch after a `j` could come from the wrong address.
+
 ## 2026-09-19 -- I/O cycles
 
 PCC cycles are handled: INP 0-7 is served from monitor-set input values

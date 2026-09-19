@@ -22,6 +22,19 @@ volatile uint8_t io_in[IO_IN_PORTS];
 volatile uint8_t io_out[IO_PORTS];
 volatile uint32_t io_out_count[IO_PORTS];
 
+uint16_t io_log[IO_LOG_SIZE];
+volatile uint32_t io_log_head = 0, io_log_tail = 0;
+volatile bool trace_enabled = true;
+volatile uint32_t pci_count = 0;
+volatile uint8_t op_states_min[256], op_states_max[256];
+volatile bool op_timing_reset = false;
+
+static uint32_t sample_count = 0;  // one per clock period
+static uint32_t last_pci_t2 = 0;   // sample_count at the previous fetch
+static uint8_t cur_op = 0;         // opcode of the instruction being timed
+static bool timing_valid = false;
+static bool cur_jam = false;       // rig-injected: not timed (see chip_test.cpp)
+
 static uint32_t rd_idx = 0;
 
 static uint16_t addr = 0;
@@ -48,6 +61,7 @@ static void __not_in_flash_func(handle_sample)(uint32_t raw) {
 	uint8_t st = raw & 7;
 	uint8_t bus = (raw >> 3) & 0xFF;
 
+	sample_count++;
 	ev.raw = (uint16_t)raw;
 	ev.state = st;
 	ev.served = 0;
@@ -57,8 +71,12 @@ static void __not_in_flash_func(handle_sample)(uint32_t raw) {
 	// 8008's outputs lag: the bus still shows the PREVIOUS state's value on
 	// the first sample of a state and settles by the second. All cycle
 	// logic therefore runs on phase 2 only.
-	if (st != prev_st) {
-		prev_st = st;
+	// T1 and T1I count as one state: they differ only in the marginal S2
+	// line, and a T1 whose first sample reads T1I would otherwise never
+	// reach phase 2 and its low address byte would be lost.
+	uint8_t phase_key = st == ST_T1I ? ST_T1 : st;
+	if (phase_key != prev_st) {
+		prev_st = phase_key;
 		phase = 1;
 	} else if (phase < 0xFF) {
 		phase++;
@@ -104,6 +122,12 @@ static void __not_in_flash_func(handle_sample)(uint32_t raw) {
 				io_out[port] = addr & 0xFF;
 				io_out_count[port]++;
 				ev.flags |= EV_OUT;
+				uint32_t h = io_log_head;
+				uint32_t n = (h + 1) & (IO_LOG_SIZE - 1);
+				if (n != io_log_tail) {
+					io_log[h] = (uint16_t)(port << 8 | (addr & 0xFF));
+					io_log_head = n;
+				}
 			}
 		} else if (cycle == CYC_PCI || cycle == CYC_PCR) {
 			uint8_t data;
@@ -131,6 +155,27 @@ static void __not_in_flash_func(handle_sample)(uint32_t raw) {
 				ev.served = data;
 				ev.flags |= EV_SERVED;
 			}
+			if (cycle == CYC_PCI) {
+				// after the serve: timing bookkeeping must not delay it
+				if (op_timing_reset) {
+					timing_valid = false;
+					op_timing_reset = false;
+				}
+				if (timing_valid && !cur_jam) {
+					uint32_t states = (sample_count - last_pci_t2) >> 1;
+					if (states > 255)
+						states = 255;
+					if (states < op_states_min[cur_op])
+						op_states_min[cur_op] = states;
+					if (states > op_states_max[cur_op])
+						op_states_max[cur_op] = states;
+				}
+				timing_valid = true;
+				last_pci_t2 = sample_count;
+				cur_op = data;
+				cur_jam = (ev.flags & EV_JAM) != 0;
+				pci_count++;
+			}
 		}
 		break;
 
@@ -150,6 +195,8 @@ static void __not_in_flash_func(handle_sample)(uint32_t raw) {
 	ev.cycle = cycle;
 
 queue_event:
+	if (!trace_enabled)
+		return;
 	// Identical consecutive samples (idle WAIT/STOP periods) are not worth
 	// displaying; annotated phase-2 events always pass (flags set).
 	if (ev.raw == prev_raw && ev.flags == 0)

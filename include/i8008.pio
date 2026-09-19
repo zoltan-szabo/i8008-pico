@@ -27,7 +27,7 @@
 
 ; ---------------------------------------------------------------------------
 ; clk: non-overlapping two-phase clock on PIN_CLK1/PIN_CLK2.
-; 4 instructions per period; with clkdiv 66 at 125 MHz this is 473 kHz.
+; 4 instructions per period; with clkdiv 66 at 133 MHz this is 504 kHz.
 ; ---------------------------------------------------------------------------
 .program clk
 .wrap_target
@@ -109,7 +109,7 @@ iloop:
 ; The 8008 latches read data at the START of T3, so the byte must already be
 ; stable on the bus when T3 begins. core1 pushes the byte during T2; the SM
 ; preloads the output latches and takes the bus at the next phi2 FALLING
-; edge -- the point where the CPU stops driving its T2 address, 528 ns
+; edge -- the point where the CPU stops driving its T2 address, 496 ns
 ; before the phi1 rising edge that starts T3 (our own clock's dead band, so
 ; no contention). It then holds the bus through any WAIT states (bus floats
 ; there; single stepping parks between T2 and T3) until the state lines

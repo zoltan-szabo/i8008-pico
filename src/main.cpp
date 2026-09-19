@@ -114,12 +114,24 @@ static void cmd_halt() {
 	Serial.println("halt: READY low");
 }
 
+static uint clk_div = CLK_DIV;
+
+void int_pulse() {
+	pio_sm_put_blocking(pio0, sm_int, INT_PULSE_PERIODS * 4 * clk_div);
+}
+
+// Takes effect immediately; only called while the chip is stopped.
+void set_clock_div(uint div) {
+	clk_div = div;
+	pio_sm_set_clkdiv_int_frac(pio0, sm_clk, div, 0);
+}
+
 static void cmd_int() {
-	pio_sm_put_blocking(pio0, sm_int, INT_PULSE_CYCLES);
+	int_pulse();
 	Serial.println("INT pulse");
 }
 
-static void arm_jam(const uint8_t *seq, uint8_t len) {
+void arm_jam(const uint8_t *seq, uint8_t len) {
 	jam_len = 0; // disarm while updating
 	jam_pos = 0;
 	for (uint8_t i = 0; i < len; i++)
@@ -132,7 +144,7 @@ static void cmd_boot() {
 	static const uint8_t rst0[] = {0x05};
 	arm_jam(rst0, 1);
 	pio_sm_set_pins_with_mask(pio0, sm_step, 1u << PIN_READY, 1u << PIN_READY);
-	pio_sm_put_blocking(pio0, sm_int, INT_PULSE_CYCLES);
+	int_pulse();
 }
 
 // Read up to maxdigits hex digits terminated by Enter. Echoes input; returns
@@ -188,7 +200,7 @@ static void cmd_jump() {
 	target &= RAM_MASK;
 	uint8_t jmp[3] = {0x44, (uint8_t)(target & 0xFF), (uint8_t)(target >> 8)};
 	arm_jam(jmp, 3);
-	pio_sm_put_blocking(pio0, sm_int, INT_PULSE_CYCLES);
+	int_pulse();
 	Serial.printf("jam JMP 0x%04X armed, INT pulsed\n", target);
 }
 
@@ -260,6 +272,8 @@ static void cmd_help() {
 	Serial.println("  x  dump RAM 0x0000-0x007F");
 	Serial.println("  n  set an input port (INP 0-7) value");
 	Serial.println("  p  show input ports and last OUT per port");
+	Serial.println("  t  chip test: functional + timing + clock sweep");
+	Serial.println("  T  chip test with exhaustive ALU (several minutes)");
 	Serial.println("  z  reset bus_write SM (release the bus)");
 	Serial.println("  d  toggle raw sample dump");
 	Serial.println("  h  this help");
@@ -377,6 +391,8 @@ void loop() {
 		case 'x': cmd_dump(); break;
 		case 'n': cmd_set_input(); break;
 		case 'p': cmd_ports(); break;
+		case 't': chip_test(false); break;
+		case 'T': chip_test(true); break;
 		case 'z': cmd_bus_reset(); break;
 		case 'd':
 			raw_debug = !raw_debug;

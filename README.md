@@ -22,7 +22,7 @@ Verified on the real chip (August 2026):
 - Boot: the 8008 has no reset pin, so I interrupt it and jam a RST 0
   instruction onto the bus; the PC lands at 0x0000 and my program runs.
 - Program execution from emulated memory: the CPU fetches every byte from a
-  16 KB array in the Pico's RAM at 473 kHz, full speed, and the test
+  16 KB array in the Pico's RAM at 504 kHz, full speed, and the test
   program's counter is observable in a RAM dump while it runs.
 - Memory writes: PCW cycles are decoded and committed back into the array.
 - Single-stepping: one machine cycle per keypress, with a gap-free trace.
@@ -110,8 +110,10 @@ needs a scope session; until then the workaround is solid.
 **The chip is dynamic and it dies cold.** PMOS dynamic logic loses its mind
 when the clock stops, which happens for two seconds at every firmware
 reflash. The first boot afterwards fetches nonsense and usually halts;
-the second or third `b` finds a warmed-up, sane CPU. Also, INT pulses
-shorter than about 4 microseconds are simply not recognized.
+the second or third `b` finds a warmed-up, sane CPU. Also, the INT pulse
+has to last until the chip enters T1I: a halted chip woken by a pulse of
+two clock periods sometimes did a plain fetch and halted again. The rig
+now holds INT for four periods, about 8 us.
 
 **There is no reset.** The only way to control the PC from outside is
 through the instruction stream itself. `b` jams RST 0 (a one-byte call to
@@ -145,6 +147,8 @@ does not matter which socket or name the board gets; `pio device monitor -p
 | x   | dump emulated RAM 0x0000-0x00FF |
 | n   | set an input port: prompts for the port (0-7) and a hex byte that INP will read |
 | p   | show the input ports and the last value OUT wrote to each output port, with write counts |
+| t   | chip test: functional suite, timing check and clock sweep, about 7 s ([docs/chip-testing.md](docs/chip-testing.md)) |
+| T   | chip test with every ALU operation over all operand pairs added, about 4 minutes |
 | z   | force-release the data bus and reset the bus-drive state machine |
 | d   | toggle raw 14-bit sample dump |
 | h   | this list |
@@ -170,7 +174,7 @@ second sample often shows internal register values passing over the bus
 (the accumulator, for instance, is readable in the counter program's T4
 states).
 
-In free run the CPU produces around 470k samples per second and USB serial
+In free run the CPU produces around 500k samples per second and USB serial
 prints a small fraction of them; the monitor reports how many trace lines
 were dropped. Nothing is lost inside: the engine sees every sample and the
 memory emulation never misses a cycle. For gap-free reading, halt with `w`
@@ -232,7 +236,7 @@ assembled by `pre_build.py` with pioasm.
 
 Five PIO state machines do the hard real-time work:
 
-- `clk` (PIO0): non-overlapping two-phase clock, 473 kHz (125 MHz / 66 / 4).
+- `clk` (PIO0): non-overlapping two-phase clock, 504 kHz (133 MHz / 66 / 4).
 - `single_step` (PIO0): a READY pulse synchronized to SYNC and the clock,
   advancing exactly one machine cycle.
 - `int_request` (PIO0): the INT pulse, raised on a CLK1 edge.
@@ -250,7 +254,9 @@ handles the jam sequence, commits PCW writes, serves INP and records OUT
 on PCC, and hands events to core 0
 through the RAM-resident SPSC ring. The whole path is pinned out of flash.
 Core 0 (`main.cpp`) owns the CLI and the trace printer, draining events in
-bounded bursts so commands stay responsive under full trace load.
+bounded bursts so commands stay responsive under full trace load. The chip
+test (`chip_test.cpp`) also runs on core 0; for it, core 1 logs every OUT
+into a second ring and measures each instruction's length in T-states.
 
 ## Pico to 8008 connections
 
@@ -263,13 +269,18 @@ predates this repository.
 
 ## The thorough test
 
-The actual goal of all this: a systematic exercise of the real silicon --
-instruction set coverage, interrupt behavior, timing envelopes, the odd
-corners (the circular stack, HLT/interrupt interactions, INP/OUT). Not
-written yet; the plan and results will be added here.
+The actual goal of all this: a systematic exercise of the real silicon.
+It exists now as the `t` and `T` commands, which turn the rig into a chip
+tester: every instruction in every form, flags, all ports, the address
+lines, the circular stack, HLT and interrupt resume, the T-state length of
+every opcode, and a clock sweep. [docs/chip-testing.md](docs/chip-testing.md)
+describes how to test a chip, how to read the result, how the test works,
+and what my own chip showed.
 
 ## Open points
 
 - Scope the S2 level shifter; T1I/T1 and T4/STOP confusions trace back to it.
 - A way to load programs over serial instead of reflashing.
+- A clock with the datasheet's phase widths instead of four equal steps, so
+  the chip test's clock sweep becomes a real speed grade.
 - The KiCad schematic, then the connections chapter above.
