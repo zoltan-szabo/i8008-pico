@@ -91,7 +91,10 @@ extern volatile uint32_t pci_count;                // instruction fetches served
 extern volatile uint8_t op_states_min[256], op_states_max[256];
 extern volatile bool op_timing_reset; // core 0 sets after clearing the tables
 
-void arm_jam(const uint8_t *seq, uint8_t len);
+void jam_prepare(const uint8_t *seq, uint8_t len); // disarmed, fix-ups cleared
+void jam_fix(uint8_t fetch, uint8_t pos, int8_t delta);
+void jam_publish(uint8_t len);
+void arm_jam(const uint8_t *seq, uint8_t len); // prepare + publish
 void int_pulse();
 void set_clock_div(uint div);
 void chip_test(bool full); // chip_test.cpp
@@ -101,8 +104,26 @@ extern volatile uint32_t evq_dropped;
 // instruction fetch (PCI), continuing over the following PCR cycles.
 // {0x05} = RST 0 (boot); {0x44, lo, hi} = JMP addr (the 'j' command).
 // Writer (core 0) must fill jam_seq and jam_pos first, jam_len last.
-extern volatile uint8_t jam_seq[3];
+// While a jam runs, the address of every fetch it serves is recorded in
+// jam_pci, and memory writes are recorded in jam_wr instead of committed
+// (the 'r' command). Fix-ups: when the jam's n-th fetch is recorded and
+// jam_fix_pos[n] is not JAM_NO_FIX, core 1 writes that fetch address plus
+// jam_fix_delta[n] into jam_seq[jam_fix_pos[n]..+1], so later jammed
+// JMPs can target addresses only the chip knows (where the jam cut in,
+// where a RET went).
+#define JAM_MAX 80
+#define JAM_PCI_MAX 40
+#define JAM_NO_FIX 0xFF
+extern volatile uint8_t jam_seq[JAM_MAX];
 extern volatile uint8_t jam_len, jam_pos;
+extern volatile uint8_t jam_wr[8], jam_nwr;
+extern volatile uint16_t jam_pci[JAM_PCI_MAX];
+extern volatile uint8_t jam_npci;
+extern volatile uint8_t jam_fix_pos[JAM_PCI_MAX];
+extern volatile int8_t jam_fix_delta[JAM_PCI_MAX];
+extern volatile uint8_t last_state; // settled state code of the latest T-state
+extern volatile uint8_t cur_cycle;  // cycle type and address of the latest
+extern volatile uint16_t cur_addr;  // machine cycle, as latched at its T2
 extern volatile bool hw_ready;
 extern uint32_t capture_ring[RING_WORDS];
 extern int dma_ch;

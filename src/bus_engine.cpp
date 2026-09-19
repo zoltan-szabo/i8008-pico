@@ -15,8 +15,16 @@ volatile uint32_t evq_head = 0, evq_tail = 0;
 // Jam sequence (see main.h): armed by 'b' (RST 0) and 'j' (JMP addr).
 // Serving it keyed on cycle type instead of T1I also sidesteps the marginal
 // S2 line, which can make an interrupt acknowledge read as a plain T1.
-volatile uint8_t jam_seq[3];
+volatile uint8_t jam_seq[JAM_MAX];
 volatile uint8_t jam_len = 0, jam_pos = 0;
+volatile uint8_t jam_wr[8], jam_nwr = 0;
+volatile uint16_t jam_pci[JAM_PCI_MAX];
+volatile uint8_t jam_npci = 0;
+volatile uint8_t jam_fix_pos[JAM_PCI_MAX];
+volatile int8_t jam_fix_delta[JAM_PCI_MAX];
+volatile uint8_t last_state = ST_WAIT;
+volatile uint8_t cur_cycle = CYC_PCI;
+volatile uint16_t cur_addr = 0;
 
 volatile uint8_t io_in[IO_IN_PORTS];
 volatile uint8_t io_out[IO_PORTS];
@@ -87,6 +95,7 @@ static void __not_in_flash_func(handle_sample)(uint32_t raw) {
 		goto queue_event;
 	}
 
+	last_state = st;
 	switch (st) {
 	case ST_T1:
 		addr = (addr & 0x3F00) | bus;
@@ -103,6 +112,8 @@ static void __not_in_flash_func(handle_sample)(uint32_t raw) {
 	case ST_T2:
 		addr = (addr & 0x00FF) | ((uint16_t)(bus & 0x3F) << 8); // D6/D7 are the cycle code, not address
 		cycle = bus >> 6;
+		cur_cycle = cycle;
+		cur_addr = addr;
 		if (int_ack)
 			ev.flags |= EV_INTACK;
 		if (cycle == CYC_PCC) {
@@ -155,6 +166,17 @@ static void __not_in_flash_func(handle_sample)(uint32_t raw) {
 				ev.served = data;
 				ev.flags |= EV_SERVED;
 			}
+			if ((ev.flags & EV_JAM) && cycle == CYC_PCI && jam_npci < JAM_PCI_MAX) {
+				// after the serve: the bytes a fix-up writes are due later
+				uint8_t i = jam_npci++;
+				jam_pci[i] = addr;
+				uint8_t pos = jam_fix_pos[i];
+				if (pos != JAM_NO_FIX) {
+					uint16_t r = (addr + jam_fix_delta[i]) & RAM_MASK;
+					jam_seq[pos] = r & 0xFF;
+					jam_seq[pos + 1] = r >> 8;
+				}
+			}
 			if (cycle == CYC_PCI) {
 				// after the serve: timing bookkeeping must not delay it
 				if (op_timing_reset) {
@@ -181,8 +203,14 @@ static void __not_in_flash_func(handle_sample)(uint32_t raw) {
 
 	case ST_T3:
 		if (cycle == CYC_PCW) {
-			i8008_ram[addr & RAM_MASK] = bus;
-			ev.flags |= EV_WRITE;
+			if (jam_pos != 0) {
+				// a jammed LMr (the jam has started, not just been armed):
+				// record, keep RAM
+				jam_wr[jam_nwr++ & 7] = bus;
+			} else {
+				i8008_ram[addr & RAM_MASK] = bus;
+				ev.flags |= EV_WRITE;
+			}
 		}
 		int_ack = false;
 		break;

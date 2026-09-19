@@ -115,6 +115,24 @@ has to last until the chip enters T1I: a halted chip woken by a pulse of
 two clock periods sometimes did a plain fetch and halted again. The rig
 now holds INT for four periods, about 8 us.
 
+**Registers are invisible.** The 8008 has no way to show its registers,
+so `r` makes the chip show them. At the next instruction fetch the rig
+jams in LMA to LML, and each memory write carries one register across the
+bus, where the engine records it instead of committing it. JTC, JTZ, JTS
+and JTP to address 0 follow: if the next fetch is not 3 bytes on, the jump
+was taken, so the flag was set. Seven RETs walk down the stack, and each
+following fetch comes from one entry. Walking back up, a JMP to three
+below each entry and a CAL there bring the PC back to exactly that entry
+before the CAL pushes it, so every level gets its own value back. A JMP
+back to the instruction the jam cut in on ends it, so no register, flag,
+memory byte or stack entry changes. The 8008 does not expose its stack
+pointer, so all seven entries show, used or not.
+While stepping, the rig steps through those cycles by itself. A chip
+parked in WAIT on an opcode fetch has not latched the opcode yet -- that
+happens at T3 -- so the rig swaps the byte it is driving for the first
+jammed instruction and the read-out takes over that very fetch; the chip
+ends up parked on it again.
+
 **There is no reset.** The only way to control the PC from outside is
 through the instruction stream itself. `b` jams RST 0 (a one-byte call to
 0x0000, which costs a push onto the internal stack), and `j` jams a full
@@ -147,6 +165,7 @@ does not matter which socket or name the board gets; `pio device monitor -p
 | x   | dump emulated RAM 0x0000-0x00FF |
 | n   | set an input port: prompts for the port (0-7) and a hex byte that INP will read |
 | p   | show the input ports and the last value OUT wrote to each output port, with write counts |
+| r   | PC, registers A-L, flags C Z S P and the 7 stack entries, newest first, without changing anything; works while stepping, running or halted. Parked on an opcode fetch it reads right there, so pressing it again shows the same; parked mid-instruction it lets that instruction finish first |
 | t   | chip test: functional suite, timing check and clock sweep, about 7 s ([docs/chip-testing.md](docs/chip-testing.md)) |
 | T   | chip test with every ALU operation over all operand pairs added, about 4 minutes |
 | z   | force-release the data bus and reset the bus-drive state machine |
@@ -190,6 +209,7 @@ and step with `s`.
     w            halt again
     x            0x0040 has advanced
     s s s ...    watch LMA write the counter, JMP loop back, ADI increment
+    r            PC, registers, flags: A holds the counter, HL = 0040
     j 0007       jump to the LAI, resetting the counter, without a reset pin
 
 ## The test program

@@ -131,12 +131,29 @@ static void cmd_int() {
 	Serial.println("INT pulse");
 }
 
-void arm_jam(const uint8_t *seq, uint8_t len) {
+void jam_prepare(const uint8_t *seq, uint8_t len) {
 	jam_len = 0; // disarm while updating
 	jam_pos = 0;
+	jam_nwr = 0;
+	jam_npci = 0;
+	for (uint8_t i = 0; i < JAM_PCI_MAX; i++)
+		jam_fix_pos[i] = JAM_NO_FIX;
 	for (uint8_t i = 0; i < len; i++)
 		jam_seq[i] = seq[i];
-	jam_len = len; // publish last
+}
+
+void jam_fix(uint8_t fetch, uint8_t pos, int8_t delta) {
+	jam_fix_delta[fetch] = delta;
+	jam_fix_pos[fetch] = pos;
+}
+
+void jam_publish(uint8_t len) {
+	jam_len = len; // last: core 1 acts on it
+}
+
+void arm_jam(const uint8_t *seq, uint8_t len) {
+	jam_prepare(seq, len);
+	jam_publish(len);
 }
 
 static void cmd_boot() {
@@ -235,6 +252,121 @@ static void cmd_ports() {
 		Serial.println("out: no OUT executed yet");
 }
 
+// PC, registers, flags and stack, read at the next instruction boundary
+// without changing any state. Jammed in, in order:
+//   LMA..LML      each memory write carries one register (recorded, not
+//                 committed)
+//   JTC..JTP 0    a fetch that does not follow on at +3 means taken
+//   RET x7        walks down the stack: each next fetch is an entry
+//   JMP e-3, CAL  x7, walking back up from the oldest entry: the CAL's
+//                 three bytes bring the PC back to e, which it pushes, so
+//                 every level gets its own value back
+//   JMP back      to the instruction the jam cut in on
+// A halted chip is woken with INT and sent back: JMP to one before the
+// resume address, where a jammed HLT leaves the PC exactly as it was. A
+// chip parked in WAIT on an opcode fetch has not latched the opcode yet
+// (that happens at T3), so the jam takes over that very fetch and the chip
+// ends up parked on it again.
+enum { RD_FLAGS = 7, RD_RET = 11, RD_CLIMB = 18, RD_FETCHES = 33 }; // jam fetch indexes
+
+static void cmd_regs() {
+	static const char *const NAME = "ABCDEHL";
+	bool halted = last_state == ST_STOPPED;
+	bool stepping = !gpio_get(PIN_READY) && !halted;
+	bool at_fetch = stepping && last_state == ST_WAIT && cur_cycle == CYC_PCI;
+	uint8_t seq[JAM_MAX];
+	uint8_t n = 0;
+	for (uint8_t r = 0; r < 7; r++)
+		seq[n++] = 0xF8 | r; // LMr
+	for (uint8_t c = 0; c < 4; c++) {
+		seq[n++] = 0x60 | c << 3; // JTc 0x0000
+		seq[n++] = 0x00;
+		seq[n++] = 0x00;
+	}
+	for (uint8_t k = 0; k < 7; k++)
+		seq[n++] = 0x07; // RET
+	uint8_t climb_pos[8];
+	for (uint8_t k = 7; k >= 1; k--) {
+		seq[n++] = 0x44; // JMP entry k - 3
+		climb_pos[k] = n;
+		seq[n++] = 0;
+		seq[n++] = 0;
+		seq[n++] = 0x46; // CAL 0x0000
+		seq[n++] = 0;
+		seq[n++] = 0;
+	}
+	uint8_t ret_pos = n + 1;
+	seq[n++] = 0x44; // JMP back
+	seq[n++] = 0;
+	seq[n++] = 0;
+	if (halted)
+		seq[n++] = 0x00; // HLT
+
+	bool trace_was = trace_enabled;
+	trace_enabled = false;
+	jam_prepare(seq, n);
+	// entry k is the fetch after the k-th RET
+	for (uint8_t k = 1; k <= 7; k++)
+		jam_fix(RD_RET + k, climb_pos[k], -3);
+	if (at_fetch) {
+		// core 1 is idle in WAIT: start the jam on the parked fetch by hand
+		uint16_t p = cur_addr;
+		jam_seq[ret_pos] = p & 0xFF;
+		jam_seq[ret_pos + 1] = p >> 8;
+		jam_pci[0] = p;
+		jam_npci = 1;
+		jam_pos = 1;
+		jam_publish(n);
+		bus_write_reset(); // drop the real opcode, serve the jam's first byte
+		pio_sm_put(pio1, sm_bus_write, seq[0]);
+	} else {
+		jam_fix(0, ret_pos, halted ? -1 : 0);
+		jam_publish(n);
+		if (halted)
+			int_pulse();
+	}
+	uint32_t t0 = millis();
+	if (stepping) {
+		// one machine cycle per step until the jam is through, then one
+		// more to park on the fetch of the instruction it cut in on
+		for (int i = 0; i < 200 && jam_len != 0; i++) {
+			pio_sm_put_blocking(pio0, sm_step, 1);
+			delay(2);
+		}
+		pio_sm_put_blocking(pio0, sm_step, 1);
+		delay(2);
+	} else {
+		while (jam_len != 0 && millis() - t0 < 200)
+			;
+		delay(2);
+	}
+	trace_enabled = trace_was;
+
+	if (jam_len != 0 || jam_nwr != 7 || jam_npci < RD_FETCHES) {
+		arm_jam(nullptr, 0);
+		Serial.println("regs: the chip did not run the read-out");
+		return;
+	}
+	uint16_t pc = jam_pci[0]; // the fetch the read-out cut in on
+	Serial.printf("PC=%04X  ", pc);
+	for (uint8_t r = 0; r < 7; r++)
+		Serial.printf("%c=%02X ", NAME[r], jam_wr[r]);
+	Serial.print(" flags ");
+	for (uint8_t c = 0; c < 4; c++) {
+		uint16_t fall_through = (jam_pci[RD_FLAGS + c] + 3) & RAM_MASK;
+		Serial.printf("%c%u ", "CZSP"[c], jam_pci[RD_FLAGS + c + 1] != fall_through);
+	}
+	char mn[8];
+	Serial.printf(" next: %s%s\n", i8008_mnemonic(i8008_ram[pc], mn), halted ? " (halted)" : "");
+	Serial.print("stack, newest first:");
+	for (uint8_t k = 1; k <= 7; k++)
+		Serial.printf(" %04X", jam_pci[RD_RET + k]);
+	// the first CAL of the climb must sit 3 below the oldest entry
+	if (jam_pci[RD_CLIMB + 1] != ((jam_pci[RD_CLIMB] - 3) & RAM_MASK))
+		Serial.print("  (climb check failed: stack may be disturbed)");
+	Serial.println();
+}
+
 static void cmd_dump() {
 	for (uint16_t a = 0; a < 0x100; a += 16) {
 		Serial.printf("%04X:", a);
@@ -272,6 +404,7 @@ static void cmd_help() {
 	Serial.println("  x  dump RAM 0x0000-0x007F");
 	Serial.println("  n  set an input port (INP 0-7) value");
 	Serial.println("  p  show input ports and last OUT per port");
+	Serial.println("  r  registers and flags (at the next instruction)");
 	Serial.println("  t  chip test: functional + timing + clock sweep");
 	Serial.println("  T  chip test with exhaustive ALU (several minutes)");
 	Serial.println("  z  reset bus_write SM (release the bus)");
@@ -391,6 +524,7 @@ void loop() {
 		case 'x': cmd_dump(); break;
 		case 'n': cmd_set_input(); break;
 		case 'p': cmd_ports(); break;
+		case 'r': cmd_regs(); break;
 		case 't': chip_test(false); break;
 		case 'T': chip_test(true); break;
 		case 'z': cmd_bus_reset(); break;

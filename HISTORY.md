@@ -2,6 +2,21 @@
 
 Release notes. Commit messages stay short; the detail lives here.
 
+## 2026-09-19 -- Register view
+
+`r` shows the PC, registers A-L, flags C Z S P and the 7 stack entries at
+the next instruction boundary, without changing any state: the rig jams
+in LMA..LML and records each register from its memory write without
+committing it, reads the flags from four jammed conditional jumps, walks
+the stack down with RETs and back up with a JMP and CAL per level that
+restore every entry, and jumps back. It works
+while single-stepping (the rig steps through the injected cycles, and a
+chip parked on an opcode fetch is read right there, so repeated `r` does
+not advance the program), in free run, and on a halted chip, which is woken and put back into HLT with its
+PC unchanged. The jam sequence grew to 80 bytes, and core 1 can patch its
+JMP targets from addresses only the chip knows (where the jam cut in,
+where a RET went).
+
 ## 2026-09-19 -- Chip test
 
 `t` and `T` turn the rig into an 8008 tester (docs/chip-testing.md): 19
